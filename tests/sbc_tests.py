@@ -8,12 +8,11 @@ import torch
 from torch import eye, ones, zeros
 from torch.distributions import MultivariateNormal
 
-from sbi.diagnostics import check_sbc, run_sbc
+from sbi.analysis import check_sbc, run_sbc
 from sbi.inference import SNPE_C, simulate_for_sbi
 from sbi.simulators import linear_gaussian
 
 
-@pytest.mark.slow
 @pytest.mark.parametrize(
     "method, model",
     [
@@ -63,7 +62,9 @@ def test_sbc_checks():
     daps = prior.sample((N,))
     ranks = torch.distributions.Uniform(zeros(num_dim), L * ones(num_dim)).sample((N,))
 
-    checks = check_sbc(ranks, log_probs, prior.sample((N,)), daps, num_posterior_samples=L)
+    checks = check_sbc(
+        ranks, log_probs, prior.sample((N,)), daps, num_posterior_samples=L
+    )
     assert (checks["ks_pvals"] > 0.05).all()
     assert (checks["c2st_ranks"] < 0.55).all()
     assert (checks["c2st_dap"] < 0.55).all()

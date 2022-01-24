@@ -1,10 +1,11 @@
 import warnings
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Tuple
+from sbi.inference.posteriors.direct_posterior import DirectPosterior
 
 import torch
 from joblib import Parallel, delayed
 from torch import Tensor, ones, zeros
-from torch.distributions import Distribution, Normal, Uniform
+from torch.distributions import Distribution, Uniform
 from tqdm.auto import tqdm
 
 from sbi.inference import simulate_for_sbi
@@ -136,6 +137,8 @@ def sbc_on_batch(
         ranks: ranks of true parameters vs. posterior samples under the specified RV,
             for each posterior dimension.
         log_prob_thos: log prob of true parameters under the approximate posterior.
+            Note that this is interpretable only for normalized log probs, i.e., when
+            using (S)NPE.
         dap_samples: samples from the data averaged posterior for the current batch,
             i.e., a single sample from each approximate posterior.
     """
@@ -146,7 +149,11 @@ def sbc_on_batch(
 
     for idx, (tho, xo) in enumerate(zip(thos, xos)):
         # Log prob of true params under posterior.
-        log_prob_thos[idx] = posterior.log_prob(tho, x=xo)
+        # Using the potential here to include unnormalized posteriors,
+        if isinstance(posterior, DirectPosterior):
+            log_prob_thos[idx] = posterior.log_prob(tho, x=xo)
+        else:
+            log_prob_thos[idx] = posterior.potential(tho, x=xo)
 
         # Draw posterior samples and save one for the data average posterior.
         ths = posterior.sample((L,), x=xo, show_progress_bars=False)
@@ -166,16 +173,19 @@ def check_sbc(
     prior_samples: Tensor,
     dap_samples: Tensor,
     num_posterior_samples: int,
+    num_c2st_repetitions: int = 1,
 ) -> Dict[str, Tensor]:
     """Return uniformity checks, data averaged posterior checks and NLTP for SBC.
 
     Args:
         ranks: ranks for each sbc run and for each model parameter, i.e.,
         shape (N, dim_parameters)
-        log_probs: log probs for each sbc run, shape (N,)
+        log_probs: log probs of true parameters under approximate posteriors, for each
+            sbc run, shape (N,)
         prior_samples: N samples from the prior
         dap_samples: N samples from the data averaged posterior
         num_posterior_samples: number of posterior samples used for sbc ranking.
+        num_c2st_repetitions: number of times c2st is repeated to estimate robustness.
 
     Returns (all in a dictionary):
         ks_pvals: p-values of the Kolmogorov-Smirnov test of uniformity,
@@ -184,6 +194,9 @@ def check_sbc(
             one for each dim_parameters.
         c2st_dap: C2ST accuracy between prior and dap samples, single value.
         nltp: mean negative log prob of true parameters under approximate posteriors.
+            If N is large, e.g., N>100, then nltp can be used as a comparative measure
+            of posterior accuracy, e.g., for comparing multiple inference methods, or
+            hyperparameter settings (see Lueckmann et al. 2021, appendix for details).
     """
     if ranks.shape[0] < 100:
         warnings.warn(
@@ -192,7 +205,10 @@ def check_sbc(
             recommend using at least 100."""
         )
 
-    ks_pvals, c2st_ranks = check_uniformity(ranks, num_posterior_samples)
+    ks_pvals = check_uniformity_kolmogorov(ranks, num_posterior_samples)
+    c2st_ranks = check_uniformity_c2st(
+        ranks, num_posterior_samples, num_repetitions=num_c2st_repetitions
+    )
     c2st_scores_dap = check_prior_vs_dap(prior_samples, dap_samples)
     nltp = torch.mean(-log_probs)
 
@@ -220,10 +236,8 @@ def check_prior_vs_dap(prior_samples: Tensor, dap_samples: Tensor) -> Tensor:
     )
 
 
-def check_uniformity(
-    ranks, num_posterior_samples, num_repetitions: int = 1
-) -> Tuple[Tensor, Tensor]:
-    """Return p-values and c2st scores for uniformity of the ranks.
+def check_uniformity_kolmogorov(ranks, num_posterior_samples) -> Tensor:
+    """Return p-values for uniformity of the ranks.
 
     Calculates Kolomogorov-Smirnov test using scipy.
 
@@ -231,12 +245,9 @@ def check_uniformity(
         ranks: ranks for each sbc run and for each model parameter, i.e.,
             shape (N, dim_parameters)
         num_posterior_samples: number of posterior samples used for sbc ranking.
-        num_repetitions: repetitions of C2ST tests estimate classifier variance.
 
     Returns (all in a dictionary):
         ks_pvals: p-values of the Kolmogorov-Smirnov test of uniformity,
-            one for each dim_parameters.
-        c2st_ranks: C2ST accuracy of between ranks and uniform baseline,
             one for each dim_parameters.
     """
 
@@ -249,6 +260,26 @@ def check_uniformity(
         ],
         dtype=torch.float32,
     )
+
+    return kstest_pvals
+
+
+def check_uniformity_c2st(
+    ranks, num_posterior_samples, num_repetitions: int = 1
+) -> Tensor:
+    """Return c2st scores for uniformity of the ranks.
+
+    Run a c2st between ranks and uniform samples.
+    Args:
+        ranks: ranks for each sbc run and for each model parameter, i.e.,
+            shape (N, dim_parameters)
+        num_posterior_samples: number of posterior samples used for sbc ranking.
+        num_repetitions: repetitions of C2ST tests estimate classifier variance.
+
+    Returns (all in a dictionary):
+        c2st_ranks: C2ST accuracy of between ranks and uniform baseline,
+            one for each dim_parameters.
+    """
 
     c2st_scores = torch.tensor(
         [
@@ -265,9 +296,11 @@ def check_uniformity(
         ]
     )
 
+    # Use variance over repetitions to estimate robustness of c2st.
     if (c2st_scores.std(0) > 0.05).any():
         warnings.warn(
             "C2ST score variability is larger {0.05}, result may be unreliable."
         )
 
-    return kstest_pvals, c2st_scores.mean(0)
+    # Return the mean over repetitions as c2st score estimate.
+    return c2st_scores.mean(0)
